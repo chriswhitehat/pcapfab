@@ -1,0 +1,304 @@
+from typing import Optional
+
+from fastapi import FastAPI, Security, HTTPException, Depends
+from fastapi.security.api_key import APIKeyHeader, APIKeyQuery, APIKey
+
+from starlette.status import HTTP_403_FORBIDDEN
+
+from pydantic import BaseModel, validator, create_model
+
+import asyncio
+
+import tempfile
+import base64
+import time
+import subprocess
+import traceback
+import re
+import os
+from datetime import datetime
+from urllib.parse import urlparse
+
+import codecs
+
+API_KEY = '<%= node[:pcapfab][:api_key] %>'
+api_key_header = APIKeyHeader(name="access_token")
+
+
+
+WITH_ERRORS = True
+DEFAULT_WAIT_TIME = 0
+
+EMPTY_RESPONSE_ERROR_MSG = "There is nothing to render. This can occur when there is a refused connection." \
+                           " Please check your URL."
+
+
+class PCAP(BaseModel):
+    fabricate_start: str
+    fabricate_end: str
+    fabricate_duration: int
+    file_name: str
+    download_path: str
+    sensor: str
+    sensor_group: str
+    protected: bool
+    size: int
+
+class PCAP_Merged(BaseModel):
+    fabricate_start: str
+    fabricate_end: str
+    fabricate_duration: int
+    file_name: str
+    download_path: str
+    sensor_group: str
+    sensors: List[str]
+    protected: bool
+    size: int
+
+class PCAPFab_Metadata(BaseModel):
+    id: int
+    expiration: str
+    fabricate_start: str
+    fabricate_end: str
+    fabricate_duration: int
+    pcaps_single: List[PCAP]
+    pcaps_merged: List[PCAP_merged]
+    query: str
+    tcpdump_args: str
+    sensors_pending: List[str]
+    sensors_complete: List[str]
+    sensors_timedout: List[str]
+    status: str
+    total_size: int
+
+
+class PCAPFab_Fabricate_Request(BaseModel):
+    src_ip: Optional[str]
+    src_port: Optional[int]
+    dst_ip: Optional[str]
+    dst_port: Optional[int]
+    protocol: Optional[str]
+    before: Optional[str]
+    after: Optional[str]
+    query: Optional[str]
+    retention_days: Optional[int]
+    tcpdump_args: Optional[str]
+    merge: Optional[str]
+    file_name_prefix: Optional[str]
+
+
+class PCAPFab_Status_Request(BaseModel):
+    id: int
+
+
+class PCAPFab_List_Request(BaseModel):
+    ids: Optional[str]
+    sensor_groups: Optional[str]
+    status: Optional[str]
+
+class PCAPFab_List_Response(BaseModel): 
+    pcaps_found : Optional[bool]
+    pcaps_status : Optional[array]
+
+class PCAPFab_Purge_Request(BaseModel):
+    ids: Optional[str]
+    before: Optional[str]
+    size: Optional[int]
+    protected: Optional[bool]
+
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+
+async def get_api_key(
+    api_key_header: str = Security(api_key_header)
+):
+
+    if api_key_header == API_KEY:
+        return api_key_header
+    else:
+        raise HTTPException(
+            status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
+        )
+
+@app.get("/pcapfab/fabricate/")
+async def pcapfab_fabricate(pcapfab_get: PCAPFab_Get, api_key: APIKey = Depends(get_api_key)):
+    rasterize_url_dict = rasterize_url.dict()
+
+
+@app.get("/pcapfab/status/")
+async def pcapfab_status(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+    rasterize_url_dict = rasterize_url.dict()
+
+@app.get("/pcapfab/list/")
+async def pcapfab_list(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+    rasterize_url_dict = rasterize_url.dict()
+
+@app.get("/pcapfab/purge/")
+async def pcapfab_purge(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+    rasterize_url_dict = rasterize_url.dict()
+
+@app.get("/pcapfab/prune/")
+async def pcapfab_prune(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+    rasterize_url_dict = rasterize_url.dict()
+
+@app.get("/pcapfab/pcaps/")
+async def pcapfab_pcaps(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+    rasterize_url_dict = rasterize_url.dict()
+
+    url = codecs.decode(rasterize_url.url, 'rot13')
+    if rasterize_url.width:
+        w = rasterize_url.width
+    else:
+        w = DEFAULT_WIDTH
+
+    if rasterize_url.height:
+        h = rasterize_url.height
+    else:
+        h = DEFAULT_HIEGHT
+
+    wait_time = DEFAULT_WAIT_TIME
+    page_load = DEFAULT_PAGE_LOAD_TIME
+
+    if not (url.startswith('http')):
+        url = f"http://{url}"
+
+
+    output = rasterize(path=url, width=w, height=h, wait_time=wait_time, max_page_load_time=page_load, chrome_opts=chrome_opts)
+
+    return output
+
+
+def return_err_or_warn(msg):
+    print(msg)
+
+
+def opt_name(opt):
+    return opt.split('=', 1)[0]
+
+
+
+
+def check_response(driver):
+    EMPTY_PAGE = '<html><head></head><body></body></html>'
+    if driver.page_source == EMPTY_PAGE:
+        return_err_or_warn(EMPTY_RESPONSE_ERROR_MSG)
+
+
+
+
+def find_zombie_processes():
+    """find zombie proceses
+    Returns:
+        ([process ids], raw ps output) -- return a tuple of zombie process ids and raw ps output
+    """
+    ps_out = subprocess.check_output(['ps', '-e', '-o', 'pid,ppid,state,stime,cmd'],
+                                     stderr=subprocess.STDOUT, universal_newlines=True)
+    lines = ps_out.splitlines()
+    pid = str(os.getpid())
+    zombies = []
+    if len(lines) > 1:
+        for line in lines[1:]:
+            pinfo = line.split()
+            if pinfo[2] == 'Z' and pinfo[1] == pid:  # zombie process
+                zombies.append(pinfo[0])
+    return zombies, ps_out
+
+
+def quit_driver_and_reap_children(driver):
+    """
+    Quits the driver's session and reaps all of zombie child processes
+    :param driver: The driver
+    :return: None
+    """
+
+    print(f'Quitting driver session: {driver.session_id}')
+
+    driver.quit()
+    try:
+        zombies, ps_out = find_zombie_processes()
+        if zombies:
+            print(f'Found zombie processes will waitpid: {ps_out}')
+            for pid in zombies:
+                waitres = os.waitpid(int(pid), os.WNOHANG)[1]
+
+                print(f'waitpid result: {waitres}')
+
+        else:
+            print(f'No zombie processes found.')
+
+    except Exception as e:
+        print(f'Failed checking for zombie processes: {e}. Trace: {traceback.format_exc()}')
+
+
+def rasterize(path: str, width: int, height: int, wait_time: int = 0,
+              offline_mode: bool = False, max_page_load_time: int = 180, chrome_opts: list = []):
+    """
+    Capturing a snapshot of a path (url/file), using Chrome Driver
+    :param offline_mode: when set to True, will block any outgoing communication
+    :param path: file path, or website url
+    :param width: desired snapshot width in pixels
+    :param height: desired snapshot height in pixels
+    :param r_type: result type: .png/.pdf
+    :param wait_time: time in seconds to wait before taking a screenshot
+    """
+    driver = init_driver(offline_mode, chrome_opts)
+    page_load_time = max_page_load_time if max_page_load_time > 0 else DEFAULT_PAGE_LOAD_TIME
+    try:
+        print(f'Navigating to path: {path}. Mode: {"OFFLINE" if offline_mode else "ONLINE"}. page load: {page_load_time}')
+        driver.set_page_load_timeout(page_load_time)
+        driver.get(path)
+        driver.implicitly_wait(5)
+        if wait_time > 0 or DEFAULT_WAIT_TIME > 0:
+            time.sleep(wait_time or DEFAULT_WAIT_TIME)
+        check_response(driver)
+        print('Navigating to path - COMPLETED')
+
+        url = codecs.encode(path, 'rot13')
+        html = codecs.encode(driver.page_source, 'rot13')
+        image_b64 = base64.b64encode(get_image(driver, width, height)).decode('utf8')
+        file_name = codecs.encode(f'{urlparse(path).netloc}_{datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")}', 'rot13')
+
+        output = Rasterized_Url(image_b64=image_b64, file_name=file_name, html=html, url=url)
+
+        return output
+
+    except (InvalidArgumentException, NoSuchElementException) as ex:
+        if 'invalid argument' in str(ex):
+            err_msg = URL_ERROR_MSG + str(ex)
+            return_err_or_warn(err_msg)
+        else:
+            return_err_or_warn(f'Invalid exception: {ex}\nTrace:{traceback.format_exc()}')
+    except TimeoutException as ex:
+        return_err_or_warn(f'Timeout exception with max load time of: {page_load_time} seconds. {ex}')
+    except Exception as ex:
+        err_str = f'General error: {ex}\nTrace:{traceback.format_exc()}'
+        print(err_str)
+        return_err_or_warn(err_str)
+    finally:
+        quit_driver_and_reap_children(driver)
+
+
+
+
+def main():
+    global testout
+    try:
+
+        wait_time = DEFAULT_WAIT_TIME
+        page_load = DEFAULT_PAGE_LOAD_TIME
+
+        url = Rasterize_Url(url='https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb')
+
+        output = rasterize(path=url.url, width=url.width, height=url.height, wait_time=wait_time, max_page_load_time=page_load)
+        # testout = asyncio.run(create_rasterize_url(url))
+
+    except Exception as ex:
+        return_err_or_warn(f'Unexpected exception: {ex}\nTrace:{traceback.format_exc()}')
+
+
+
+if __name__ in ["__builtin__", "builtins", '__main__']:
+    main()
+    

@@ -1,0 +1,12 @@
+[Unit]
+Description=Gunicorn instance to serve PCAPS
+After=network.target
+
+[Service]
+User=pcapfab
+Group=pcapfab
+WorkingDirectory=/opt/pcapfab/
+ExecStart=/usr/local/bin/gunicorn pcapfab:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --keyfile=/opt/pcapfab/key.pem --certfile=/opt/pcapfab/cert.pem --error-logfile /var/log/pcapfab.log --access-logfile /var/log/pcapfab.log --capture-output --bind 0.0.0.0:8000
+
+[Install]
+WantedBy=multi-user.target
