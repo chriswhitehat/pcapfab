@@ -8,7 +8,7 @@
 
 apt_update
 
-package ['python3-pip', 'zip', 'unzip'] do
+package ['python3-pip', 'zip', 'unzip', 'wireshark-common'] do
   action :install
 end
 
@@ -23,22 +23,61 @@ user 'pcapfab' do
   system true
 end
 
-directory '/opt/pcapfab' do
-  owner 'pcapfab'
-  group 'pcapfab'
-  mode '0755'
+user 'nsm' do
+  action :create
+  system true
+end
+
+group 'stenographer' do
+  action :create
+  append true
+  members ['pcapfab']
+end
+
+group 'nsm' do
+  action :create
+  append true
+  members ['pcapfab']
+end
+
+
+directory '/nsm' do
+  owner 'nsm'
+  group 'nsm'
+  mode '0750'
   action :create
 end
 
-template '/opt/pcapfab/pcapfab.py' do
-  source 'pcapfab.py.erb'
+direcotries = ['/nsm/pcapfab',
+               '/nsm/pcapfab/pending',
+               '/nsm/pcapfab/finished',
+               '/nsm/pcapfab/pcaps',
+               '/nsm/pcapfab/files']
+
+direcotries.each do |dir|
+  directory dir do
+    owner 'pcapfab'
+    group 'nsm'
+    mode '0750'
+    action :create
+  end
+end
+
+directory '/opt/pcapfab' do
   owner 'pcapfab'
   group 'pcapfab'
-  mode '0644'
+  mode '0750'
+  action :create
+end
+
+group 'nsm' do
+  action :create
+  append true
+  members ['pcapfab']
 end
 
 
-pip_packages = ['fastapi', 'pydantic', 'uvicorn', 'gunicorn']
+pip_packages = ['fastapi', 'pydantic', 'uvicorn', 'gunicorn', 'python-dateutil']
 
 
 pip_packages.each do |pip_pkg|
@@ -68,11 +107,21 @@ file '/var/log/pcapfab.log' do
   not_if do ::File.exists?('/var/log/pcapfab.log') end
 end
 
+
 template '/etc/systemd/system/pcapfab.service' do
   source 'pcapfab.service.erb'
   owner 'root'
   group 'root'
   mode '0644'
+end
+
+
+template '/opt/pcapfab/pcapfab.py' do
+  source 'pcapfab.py.erb'
+  owner 'pcapfab'
+  group 'pcapfab'
+  mode '0644'
+  notifies :restart, 'systemd_unit[pcapfab.service]'
 end
 
 systemd_unit 'pcapfab.service' do

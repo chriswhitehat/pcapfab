@@ -17,13 +17,17 @@ Vagrant.configure("2") do |config|
   
   config.butcher.verify_ssl = false
 
-  config.vm.define "rasterize" do |rasterize|
-    rasterize.vm.box = "ubuntu/focal64"
-    rasterize.vm.hostname = "rasterize01"
-    rasterize.vm.network "public_network", ip: '192.168.1.25'
-    # rasterize.vm.network "private_network", ip: "192.168.50.10", virtualbox__intnet: "white_network"
-    # rasterize.vm.network :forwarded_port, guest: 8000, host: 8000, id: 'rrasterize'
-    config.vm.provider :virtualbox do |vb|
+  config.omnibus.chef_version = :latest
+  config.berkshelf.enabled = true
+  config.berkshelf.berksfile_path = "./Berksfile"
+
+  config.vm.define "pcapfab1" do |pcapfab1|
+    pcapfab1.vm.box = "ubuntu/focal64"
+    pcapfab1.vm.hostname = "pcapfab01"
+    pcapfab1.vm.network "public_network", ip: '192.168.1.25'
+    # pcapfab1.vm.network "private_network", ip: "192.168.50.10", virtualbox__intnet: "white_network"
+    pcapfab1.vm.network :forwarded_port, guest: 8000, host: 8000, id: 'pcapfab1'
+    pcapfab1.vm.provider :virtualbox do |vb|
       vb.linked_clone = true
       vb.customize ["modifyvm", :id, "--memory", "1024"]
       # vb.customize ['modifyvm', :id, '--natnet1', '192.168.222.0/24']
@@ -31,10 +35,19 @@ Vagrant.configure("2") do |config|
     end
   end
 
-
-  config.omnibus.chef_version = :latest
-  config.berkshelf.enabled = true
-  config.berkshelf.berksfile_path = "./Berksfile"
+  config.vm.define "pcapfab2" do |pcapfab2|
+    pcapfab2.vm.box = "ubuntu/focal64"
+    pcapfab2.vm.hostname = "pcapfab01"
+    pcapfab2.vm.network "public_network", ip: '192.168.1.26'
+    # pcapfab2.vm.network "private_network", ip: "192.168.50.10", virtualbox__intnet: "white_network"
+    pcapfab2.vm.network :forwarded_port, guest: 8000, host: 8001, id: 'pcapfab2'
+    pcapfab2.vm.provider :virtualbox do |vb|
+      vb.linked_clone = true
+      vb.customize ["modifyvm", :id, "--memory", "1024"]
+      # vb.customize ['modifyvm', :id, '--natnet1', '192.168.222.0/24']
+      vb.customize ['modifyvm', :id, "--natdnshostresolver1", "off"]
+    end
+  end
 
   config.vm.provision "chef_zero" do |chef|
     # Specify the local paths where Chef data is stored
@@ -45,7 +58,7 @@ Vagrant.configure("2") do |config|
     #config.vm.box = "centos/8"
      
     # Add a recipe
-    chef.add_recipe "remote_rasterize"
+    chef.add_recipe "pcapfab"
 
     chef.arguments = "--chef-license accept"
   end

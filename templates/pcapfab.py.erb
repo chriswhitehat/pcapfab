@@ -1,14 +1,17 @@
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import FastAPI, Security, HTTPException, Depends
+from fastapi import FastAPI, Security, HTTPException, Depends, BackgroundTasks
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery, APIKey
+from fastapi.staticfiles import StaticFiles
 
-from starlette.status import HTTP_403_FORBIDDEN
+import uuid
+
+from starlette.status import HTTP_403_FORBIDDEN, HTTP_404_NOT_FOUND
 
 from pydantic import BaseModel, validator, create_model
 
 import asyncio
-
+import socket
 import tempfile
 import base64
 import time
@@ -16,15 +19,23 @@ import subprocess
 import traceback
 import re
 import os
-from datetime import datetime
-from urllib.parse import urlparse
-
+import shutil
+import json
 import codecs
+import requests
+from time import sleep
+from dateutil.parser import parse, ParserError
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
+from subprocess import Popen, PIPE
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 API_KEY = '<%= node[:pcapfab][:api_key] %>'
 api_key_header = APIKeyHeader(name="access_token")
 
-
+DEFAULT_RETENTION_DAYS = <%= node[:pcapfab][:retention_days] %>
 
 WITH_ERRORS = True
 DEFAULT_WAIT_TIME = 0
@@ -33,61 +44,236 @@ EMPTY_RESPONSE_ERROR_MSG = "There is nothing to render. This can occur when ther
                            " Please check your URL."
 
 
-class PCAP(BaseModel):
-    fabricate_start: str
-    fabricate_end: str
-    fabricate_duration: int
+
+
+def runBash(cmd):
+    p = Popen(cmd, shell=True, stdout=PIPE)
+    out = p.stdout.read().strip()
+    return out
+
+
+def pollChildren(children):
+    for p in children:
+        if p.poll() is not None:
+            children.remove(p)
+
+
+def runBashParallel(children, cmd, threads=5):
+
+    pollChildren(children)
+
+    while len(children) >= threads:
+        sleep(0.5)
+        pollChildren(children)
+
+    children.append(Popen(cmd, shell=True))
+    sleep(0.5)
+
+
+class PCAPFab_PCAP_Metadata(BaseModel):
+    id: int
+    pcap_start: str
+    pcap_end: Optional[str]
+    pcap_duration: Optional[int]
     file_name: str
-    download_path: str
+    download_link: Optional[str]
     sensor: str
-    sensor_group: str
-    protected: bool
-    size: int
+    size: Optional[int]
+    status: str
+    status_msg: Optional[str]
+    status_updated: str
 
-class PCAP_Merged(BaseModel):
-    fabricate_start: str
-    fabricate_end: str
-    fabricate_duration: int
-    file_name: str
-    download_path: str
-    sensor_group: str
-    sensors: List[str]
-    protected: bool
-    size: int
 
-class PCAPFab_Metadata(BaseModel):
+class PCAPFab_PCAP_Request(BaseModel):
+    id: int
+    after: str
+    before: str
+    query: str
+    pcap_dir: str
+    sensor: str
+    tcpdump_args: Optional[str]
+
+    @validator('*')
+    def no_single_quotes(cls, v):
+
+        if isinstance(v, str):
+            if "'" in v:
+                raise ValueError('inputs must not contain single quotes')
+        return v
+
+
+class PCAPFab_PCAP_Status(BaseModel):
+    id: int
+
+
+class PCAPFab_Fabricate_Metadata(BaseModel):
     id: int
     expiration: str
     fabricate_start: str
-    fabricate_end: str
+    fabricate_end: Optional[str]
     fabricate_duration: int
-    pcaps_single: List[PCAP]
-    pcaps_merged: List[PCAP_merged]
+    after: str
+    before: str
     query: str
-    tcpdump_args: str
-    sensors_pending: List[str]
-    sensors_complete: List[str]
-    sensors_timedout: List[str]
+    tcpdump_args: Optional[str]
+    pcaps_dir: Optional[str]
+    file_name: str
+    pcaps: Optional[List[PCAPFab_PCAP_Metadata]]
+    sensor: str
+    download_link: Optional[str]
     status: str
-    total_size: int
+    status_msg: Optional[str]
+    status_updated: str
+    total_size: int = 0
 
 
 class PCAPFab_Fabricate_Request(BaseModel):
-    src_ip: Optional[str]
-    src_port: Optional[int]
-    dst_ip: Optional[str]
-    dst_port: Optional[int]
-    protocol: Optional[str]
+    host: Optional[str]
+    net: Optional[str]
+    port: Optional[str]
+    protocol: Optional[int]
+    after: str
     before: Optional[str]
-    after: Optional[str]
     query: Optional[str]
-    retention_days: Optional[int]
     tcpdump_args: Optional[str]
-    merge: Optional[str]
     file_name_prefix: Optional[str]
+    sensor: str
+    sensor_group: str
+    sensor_group_name: str
+
+    @validator('*')
+    def no_single_quotes(cls, v):
+
+        if isinstance(v, str):
+            if "'" in v:
+                raise ValueError('inputs must not contain single quotes')
+        return v
 
 
-class PCAPFab_Status_Request(BaseModel):
+    @validator('host')
+    def host_validator(cls, v):
+
+        try:
+            hosts = [x.strip() for x in v.split(',')]
+            for host in hosts:
+                socket.inet_aton(host)
+
+        except socket.error:
+            raise ValueError('must be a valid IP address')
+        return v
+
+
+    @validator('net')
+    def net_validator(cls, v):
+
+        try:
+            nets = [x.strip() for x in v.split(',')]
+            for net in nets:
+                if '/' not in net:
+                    raise ValueError('must be in cidr format')
+
+                ip, cidr = net.split('/')
+
+                if cidr > 32:
+                    raise ValueError('must be a valid cidr')
+
+                socket.inet_aton(ip)
+
+        except socket.error:
+            raise ValueError('must be a valid IP address')
+        return v
+
+
+    @validator('port')
+    def port_validator(cls, v):
+
+        try:
+            ports = [int(x.strip()) for x in v.split(',')]
+        except:
+            raise ValueError('invalid port number %s' % v)
+
+        for port in ports:
+            if port not in range(0, 65536):
+                raise ValueError('invalid port number')
+        return v
+        
+
+    @validator('protocol')
+    def protocol_validator(cls, v):
+        protocols = set(range(0,144))
+        protocols.add(252)
+        protocols.add(253)
+        protocols.add(254)
+
+        if v not in protocols:
+            raise ValueError('invalid protocol number')
+        return v
+
+
+    @validator('before', 'after')
+    def time_validator(cls, v):
+
+        now = datetime.now()
+
+        vmod = re.match('\s*(\d+)([hH]|[mM])\s*$', v.replace('ago', ''))
+
+        if vmod:
+            count, unit = vmod.groups()
+
+            try:
+                if unit.lower() == 'h':
+                    return (now - timedelta(hours=int(count))).strftime('%Y-%m-%dT%H:%M:%SZ')
+                elif unit.lower() == 'm':
+                    return (now - timedelta(minutes=int(count))).strftime('%Y-%m-%dT%H:%M:%SZ')
+                else:
+                    raise ValueError('incorrect units, h or m supported')
+            except:
+                raise ValueError('parsing error via "ago" method')
+
+        try:
+            d = parse(v)
+        except ParserError as e:
+            raise ParserError('invalid date string')
+        return v
+
+
+    @validator('file_name_prefix')
+    def file_name_prefix_validator(cls, v):
+
+        if not v.replace('_', '').isalnum():
+            raise ValueError('file name prefix must only contain alphanumeric and underscore charecters')    
+        return v
+
+
+    @validator('tcpdump_args')
+    def tcpdump_args_validator(cls, v):
+
+        if '-w' not in v:
+            raise ValueError("file write flag '-w' not allowed")    
+        return v
+
+
+    @validator('sensor')
+    def sensor_validator(cls, v):
+
+        if not is_valid_hostname(v):
+            raise ValueError('sensor must consist of comma separated valid hostnames')
+
+        return v
+
+    @validator('sensor_group')
+    def sensor_group_validator(cls, v):
+
+        sensors = []
+
+        for sensor in [x.strip() for x in v.split(',')]:
+            if not is_valid_hostname(sensor):
+                raise ValueError('sensor_group must consist of comma separated valid hostnames')
+            sensors.append(sensor)
+        return sensors
+
+
+class PCAPFab_Fabricate_Status(BaseModel):
     id: int
 
 
@@ -96,9 +282,11 @@ class PCAPFab_List_Request(BaseModel):
     sensor_groups: Optional[str]
     status: Optional[str]
 
+
 class PCAPFab_List_Response(BaseModel): 
     pcaps_found : Optional[bool]
-    pcaps_status : Optional[array]
+    pcaps_status : Optional[List[PCAPFab_Fabricate_Metadata]]
+
 
 class PCAPFab_Purge_Request(BaseModel):
     ids: Optional[str]
@@ -107,13 +295,13 @@ class PCAPFab_Purge_Request(BaseModel):
     protected: Optional[bool]
 
 
-
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
-async def get_api_key(
-    api_key_header: str = Security(api_key_header)
-):
+app.mount("/pcaps", StaticFiles(directory="/nsm/pcapfab/pcaps"), name="pcaps")
+
+
+async def get_api_key(api_key_header: str = Security(api_key_header) ):
 
     if api_key_header == API_KEY:
         return api_key_header
@@ -122,180 +310,501 @@ async def get_api_key(
             status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
         )
 
-@app.get("/pcapfab/fabricate/")
-async def pcapfab_fabricate(pcapfab_get: PCAPFab_Get, api_key: APIKey = Depends(get_api_key)):
-    rasterize_url_dict = rasterize_url.dict()
+
+@app.post("/pcapfab/fabricate/submit")
+async def pcapfab_fabricate(fabricate_request: PCAPFab_Fabricate_Request, backgroundtasks: BackgroundTasks, api_key: APIKey = Depends(get_api_key)):
+
+    backgroundtasks.add_task(rotate_pcaps)
+
+    fabricate_metadata = generate_fabricate_metadata(fabricate_request)    
+    write_metadata(fabricate_metadata, 'pfab')
 
 
-@app.get("/pcapfab/status/")
-async def pcapfab_status(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
-    rasterize_url_dict = rasterize_url.dict()
+    fabricate_metadata.pcaps = []
+    for sensor in fabricate_request.sensor_group:
+        fabricate_metadata.pcaps.append(request_pcap(sensor, fabricate_metadata))
 
-@app.get("/pcapfab/list/")
-async def pcapfab_list(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
-    rasterize_url_dict = rasterize_url.dict()
+    pending = False
 
-@app.get("/pcapfab/purge/")
-async def pcapfab_purge(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
-    rasterize_url_dict = rasterize_url.dict()
+    for pcap_metadata in fabricate_metadata.pcaps:
+        if pcap_metadata.status not in ["Failed", "Finished"]:
+            pending = True
 
-@app.get("/pcapfab/prune/")
-async def pcapfab_prune(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
-    rasterize_url_dict = rasterize_url.dict()
-
-@app.get("/pcapfab/pcaps/")
-async def pcapfab_pcaps(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
-    rasterize_url_dict = rasterize_url.dict()
-
-    url = codecs.decode(rasterize_url.url, 'rot13')
-    if rasterize_url.width:
-        w = rasterize_url.width
+    if pending:
+        fabricate_metadata.status = "Pending"
+        write_metadata(fabricate_metadata, 'pfab')
+        backgroundtasks.add_task(collect_pcaps, fabricate_metadata)
     else:
-        w = DEFAULT_WIDTH
+        fabricate_metadata.status = "Failed"
+        write_metadata(fabricate_metadata, 'pfab')
 
-    if rasterize_url.height:
-        h = rasterize_url.height
+    return fabricate_metadata
+
+
+@app.post("/pcapfab/fabricate/status")
+async def pcapfab_status(fabricate_status: PCAPFab_Fabricate_Status, api_key: APIKey = Depends(get_api_key)):
+
+    return load_metadata(fabricate_status.id, 'pfab')
+
+
+@app.post("/pcapfab/pcap/submit")
+async def pcapfab_status(pcap_request: PCAPFab_PCAP_Request, backgroundtasks: BackgroundTasks, api_key: APIKey = Depends(get_api_key)):
+
+    pcap_metadata = generate_pcap_metadata(pcap_request)
+    write_metadata(pcap_metadata, 'p')
+
+    backgroundtasks.add_task(stenoread, pcap_metadata, pcap_request)
+
+    return pcap_metadata
+
+
+@app.post("/pcapfab/pcap/status")
+async def pcapfab_status(pcap_status: PCAPFab_PCAP_Status, api_key: APIKey = Depends(get_api_key)):
+
+    return load_metadata(pcap_status.id, 'p')
+
+# @app.get("/pcapfab/list/")
+# async def pcapfab_list(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+#     rasterize_url_dict = rasterize_url.dict()
+
+# @app.get("/pcapfab/purge/")
+# async def pcapfab_purge(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+#     rasterize_url_dict = rasterize_url.dict()
+
+# @app.get("/pcapfab/prune/")
+# async def pcapfab_prune(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+#     rasterize_url_dict = rasterize_url.dict()
+
+# @app.get("/pcapfab/pcaps/")
+# async def pcapfab_pcaps(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+#     rasterize_url_dict = rasterize_url.dict()
+
+
+def is_valid_hostname(hostname):
+    if len(hostname) > 255:
+        return False
+    if hostname[-1] == ".":
+        hostname = hostname[:-1] # strip exactly one dot from the right, if present
+    allowed = re.compile("(?!-)[A-Z\d-]{1,63}(?<!-)$", re.IGNORECASE)
+    return all(allowed.match(x) for x in hostname.split("."))
+
+
+def rotate_pcaps():
+
+    expiration = (datetime.now() - timedelta(days=DEFAULT_RETENTION_DAYS))
+
+    if os.path.exists('/nsm/pcapfab/pcaps'):
+
+        for dir in os.listdir('/nsm/pcapfab/pcaps'):
+            try:
+                dir_date = parse(dir)
+            except:
+                continue
+
+            if dir_date.date() < expiration.date():
+                shutil.rmtree('/nsm/pcapfab/pcaps/%s/' % dir)
+
+    if os.path.exists('/nsm/pcapfab/finished'):
+        for metadata in os.listdir('/nsm/pcapfab/finished'):
+            metadata_epoch = re.match('(\d+)\.pfab$', metadata)
+            try:
+                if metadata_epoch and metadata_epoch.groups()[0] and int(metadata_epoch.groups()[0]) < int(expiration.timestamp() * 1000):
+                    os.remove('/nsm/pcapfab/finished/%s' % metadata)
+            except:
+                continue
+
+
+def load_metadata(id, extension):
+
+    pending_path = '/nsm/pcapfab/pending/%s.%s' % (id, extension)
+    finished_path = '/nsm/pcapfab/finished/%s.%s' % (id, extension)
+
+    if os.path.exists(pending_path):
+        metadata_path = pending_path
+    elif os.path.exists(finished_path):
+        metadata_path = finished_path
     else:
-        h = DEFAULT_HIEGHT
+        raise HTTPException(
+                status_code=HTTP_404_NOT_FOUND, detail="PCAPFab ID '%s' not found" % id
+            )
 
-    wait_time = DEFAULT_WAIT_TIME
-    page_load = DEFAULT_PAGE_LOAD_TIME
-
-    if not (url.startswith('http')):
-        url = f"http://{url}"
-
-
-    output = rasterize(path=url, width=w, height=h, wait_time=wait_time, max_page_load_time=page_load, chrome_opts=chrome_opts)
-
-    return output
-
-
-def return_err_or_warn(msg):
-    print(msg)
-
-
-def opt_name(opt):
-    return opt.split('=', 1)[0]
-
-
-
-
-def check_response(driver):
-    EMPTY_PAGE = '<html><head></head><body></body></html>'
-    if driver.page_source == EMPTY_PAGE:
-        return_err_or_warn(EMPTY_RESPONSE_ERROR_MSG)
-
-
-
-
-def find_zombie_processes():
-    """find zombie proceses
-    Returns:
-        ([process ids], raw ps output) -- return a tuple of zombie process ids and raw ps output
-    """
-    ps_out = subprocess.check_output(['ps', '-e', '-o', 'pid,ppid,state,stime,cmd'],
-                                     stderr=subprocess.STDOUT, universal_newlines=True)
-    lines = ps_out.splitlines()
-    pid = str(os.getpid())
-    zombies = []
-    if len(lines) > 1:
-        for line in lines[1:]:
-            pinfo = line.split()
-            if pinfo[2] == 'Z' and pinfo[1] == pid:  # zombie process
-                zombies.append(pinfo[0])
-    return zombies, ps_out
-
-
-def quit_driver_and_reap_children(driver):
-    """
-    Quits the driver's session and reaps all of zombie child processes
-    :param driver: The driver
-    :return: None
-    """
-
-    print(f'Quitting driver session: {driver.session_id}')
-
-    driver.quit()
     try:
-        zombies, ps_out = find_zombie_processes()
-        if zombies:
-            print(f'Found zombie processes will waitpid: {ps_out}')
-            for pid in zombies:
-                waitres = os.waitpid(int(pid), os.WNOHANG)[1]
-
-                print(f'waitpid result: {waitres}')
-
-        else:
-            print(f'No zombie processes found.')
-
-    except Exception as e:
-        print(f'Failed checking for zombie processes: {e}. Trace: {traceback.format_exc()}')
+        return json.load(open(metadata_path, 'r'))
+    except:
+        raise HTTPException(
+                status_code=HTTP_404_NOT_FOUND, detail="PCAPFab ID '%s' failed to load" % id
+            )
 
 
-def rasterize(path: str, width: int, height: int, wait_time: int = 0,
-              offline_mode: bool = False, max_page_load_time: int = 180, chrome_opts: list = []):
-    """
-    Capturing a snapshot of a path (url/file), using Chrome Driver
-    :param offline_mode: when set to True, will block any outgoing communication
-    :param path: file path, or website url
-    :param width: desired snapshot width in pixels
-    :param height: desired snapshot height in pixels
-    :param r_type: result type: .png/.pdf
-    :param wait_time: time in seconds to wait before taking a screenshot
-    """
-    driver = init_driver(offline_mode, chrome_opts)
-    page_load_time = max_page_load_time if max_page_load_time > 0 else DEFAULT_PAGE_LOAD_TIME
+def generate_fabricate_metadata(fabricate_request):
+
+    now = datetime.now()
+
+    id = int(now.timestamp() * 1000)
+    
+    expiration = (now + timedelta(days=DEFAULT_RETENTION_DAYS)).date().isoformat()
+
+    fabricate_start = now.isoformat()
+
+    fabricate_duration = (now - datetime.fromisoformat(fabricate_start)).seconds
+
+    pcaps_date = now.date().isoformat()
+
+    pcaps_uuid = uuid.uuid4()
+
+    if not os.path.exists('/nsm/pcapfab/pcaps/%s' % pcaps_date):
+        os.mkdir('/nsm/pcapfab/pcaps/%s' % pcaps_date)
+
+    if not os.path.exists('/nsm/pcapfab/pcaps/%s/%s' % (pcaps_date, pcaps_uuid)):
+        os.mkdir('/nsm/pcapfab/pcaps/%s/%s' % (pcaps_date, pcaps_uuid))
+
+    pcaps_dir = "%s/%s" % (pcaps_date, pcaps_uuid)
+
+    if not fabricate_request.before:
+        fabricate_request.before = datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    query = build_query(fabricate_request)
+
+    if fabricate_request.tcpdump_args:
+        tcpdump_args = fabricate_request.tcpdump_args
+    else:
+        tcpdump_args = ''
+
+    status_updated = now.isoformat()
+
+    if fabricate_request.file_name_prefix:
+        file_name = f'{fabricate_request.file_name_prefix}_'
+    else:
+        file_name = ''
+
+    file_name += f'{id}_{fabricate_request.sensor_group_name}.pcap'
+
+    return PCAPFab_Fabricate_Metadata(id=id, 
+                            expiration=expiration, 
+                            fabricate_start=fabricate_start, 
+                            fabricate_duration=fabricate_duration, 
+                            pcaps_dir=pcaps_dir,
+                            file_name=file_name,
+                            sensor=fabricate_request.sensor,
+                            after=fabricate_request.after,
+                            before=fabricate_request.before,
+                            query=query,
+                            tcpdump_args=tcpdump_args,
+                            status='Distributing',
+                            status_updated=status_updated)
+
+
+def generate_pcap_metadata(pcap_request):
+
+    now = datetime.now()
+
+    dir_date, dir_uuid = pcap_request.pcap_dir.split(os.path.sep)
+    
+    dir_base = '/nsm/pcapfab/pcaps'
+
+    if not os.path.exists(f'{dir_base}/{dir_date}'):
+        os.mkdir(f'{dir_base}/{dir_date}')
+
+    if not os.path.exists(f'{dir_base}/{dir_date}/{dir_uuid}'):
+        os.mkdir(f'{dir_base}/{dir_date}/{dir_uuid}')
+
+    sensor_name = pcap_request.sensor.split('.')[0]
+
+    return  PCAPFab_PCAP_Metadata(id=pcap_request.id,
+                                  after=pcap_request.after,
+                                  before=pcap_request.before,
+                                  query=pcap_request.query,
+                                  tcpdump_args=pcap_request.tcpdump_args,
+                                  pcap_start=datetime.now().isoformat(),
+                                  pcap_dir=pcap_request.pcap_dir,
+                                  file_name=f'{pcap_request.id}_{sensor_name}.pcap',
+                                  sensor=pcap_request.sensor,
+                                  status="Pending",
+                                  status_updated=now.isoformat())
+
+
+def write_metadata(metadata, extension):
+    pending_path = f'/nsm/pcapfab/pending/{metadata.id}.{extension}'
+    finished_path = f'/nsm/pcapfab/finished/{metadata.id}.{extension}'
+    if metadata.status == "Finished":
+        if os.path.exists(pending_path):
+            os.remove(pending_path)
+        output_path = finished_path
+    else:
+        output_path = pending_path
+
+    metadata.status_updated = datetime.now().isoformat()
+
+    with open(output_path, 'w') as out:
+        out.write(str(metadata.json()) + '\n')
+        out.flush()
+
+
+def build_query(fabricate_request: PCAPFab_Fabricate_Request):
+
+    query = []
+    if fabricate_request.query:
+        return fabricate_request.query
+
+    if fabricate_request.host:
+        query.extend(['host ' + x.strip() for x in fabricate_request.host.split(',')])
+
+    if fabricate_request.net:
+        query.append(['net ' + x.strip() for x in fabricate_request.net.split(',')])
+
+    if fabricate_request.port:
+        query.extend(['port ' + x.strip() for x in fabricate_request.port.split(',')])
+
+    if fabricate_request.protocol:
+        query.append('ip proto ' + fabricate_request.protocol)
+
+    if not query:
+        raise HTTPException(
+                status_code=HTTP_403_FORBIDDEN, detail="Failed to construct query"
+            )
+
+    return ' and '.join(query)
+
+
+def request_pcap(sensor, fabricate_metadata):
+    # try:
+    url = f'https://{sensor}:8000/pcapfab/pcap/submit'
+    headers = {'access_token': API_KEY,
+               'Content-Type': 'application/json'}
+
+    body_json = {'id': fabricate_metadata.id,
+                 'after': fabricate_metadata.after,
+                 'before': fabricate_metadata.before,
+                 'query': fabricate_metadata.query,
+                 'pcap_dir': fabricate_metadata.pcaps_dir,
+                 'sensor': sensor,
+                 'tcpdump_args': fabricate_metadata.tcpdump_args} 
+
+    r = requests.post(url, headers=headers, json=body_json, verify=False)
+
+    if r.status_code == 200:
+        return PCAPFab_PCAP_Metadata(**r.json())
+            
+    # except:
+        # pass
+
+    now = datetime.now()
+    sensor_name = sensor.split('.')[0]
+
+    return PCAPFab_PCAP_Metadata(id=fabricate_metadata.id,
+                                 pcap_start=now.isoformat(),
+                                 pcap_end=now.isoformat(),
+                                 pcap_duration=0,
+                                 file_name=f'{fabricate_metadata.id}_{sensor_name}.pcap',
+                                 sensor=sensor,
+                                 size=0,
+                                 status="Failed",
+                                 status_msg=r.text,
+                                 status_updated=now.isoformat())
+
+def request_pcap_status(pcap_metadata):
+
+    # try:
+    url = f'https://{pcap_metadata.sensor}:8000/pcapfab/pcap/status'
+    headers = {'access_token': API_KEY,
+               'Content-Type': 'application/json'}
+
+    body_json = {'id': pcap_metadata.id} 
+
+    r = requests.post(url, headers=headers, json=body_json, verify=False)
+
+    if r.status_code == 200:
+        return PCAPFab_PCAP_Metadata(**r.json())
+            
+    # except:
+        # pass
+
+    now = datetime.now()
+    sensor_name = sensor.split('.')[0]
+
+    pcap_metadata.status = "Failed"
+    pcap_metadata.status_msg = "PCAP status request failed: %s" % r.text
+
+    return pcap_metadata
+
+
+def collect_pcaps(fabricate_metadata):
+    
+    fabricate_metadata.status = "Reading"
+    write_metadata(fabricate_metadata, 'pfab')
+
+    pending = fabricate_metadata.pcaps
+    
+    dir_base = '/nsm/pcapfab/pcaps'
+
+    poll_duration = 0
+
+    merge_pcaps = []
+    while pending and poll_duration < 1800:
+        pcaps = []
+        pending = []
+        for current_pcap_metadata in fabricate_metadata.pcaps:
+            if current_pcap_metadata.status == "Finished":
+                if current_pcap_metadata.download_link:
+                    target_pcap_path = f'{dir_base}/{fabricate_metadata.pcaps_dir}/{current_pcap_metadata.file_name}'
+                    if os.path.exists(target_pcap_path):
+                        pcaps.append(current_pcap_metadata)
+                        merge_pcaps.append(target_pcap_path)
+                    else:    
+                        r = requests.get(current_pcap_metadata.download_link, verify=False)
+                        if r.status_code == 200:
+                            with open(target_pcap_path, 'wb') as f:
+                                f.write(r.content)
+                            if os.path.exists(target_pcap_path):
+                                pcaps.append(current_pcap_metadata)
+                                merge_pcaps.append(target_pcap_path)
+                        else:
+                            current_pcap_metadata.status = "Failed"
+                            current_pcap_metadata.status_msg = "Download failed: " + r.text
+                            pcaps.append(current_pcap_metadata)
+            elif current_pcap_metadata.status == "Failed":
+                pcaps.append(current_pcap_metadata)
+            else:
+                new_pcap_metadata = request_pcap_status(current_pcap_metadata)
+                pcaps.append(new_pcap_metadata)
+                pending.append(new_pcap_metadata)
+                
+
+        fabricate_metadata.pcaps = pcaps
+        write_metadata(fabricate_metadata, 'pfab')
+
+        poll_duration += 5
+        sleep(5)
+
+    fabricate_metadata.status = "Merging"
+    write_metadata(fabricate_metadata, 'pfab')
+
+    target_pcap_path = f'{dir_base}/{fabricate_metadata.pcaps_dir}/{fabricate_metadata.file_name}'
+
+    if not merge_pcaps:
+        fabricate_metadata.status = "Finished"
+        fabricate_metadata.status_msg = "No pcaps found"
+        write_metadata(fabricate_metadata, 'pfab')
+        
+    elif len(merge_pcaps) > 1:
+        runBash(f'mergecap -w {target_pcap_path} {" ".join(merge_pcaps)} && rm {" ".join(merge_pcaps)}')
+
+    else:
+        runBash(f'mv {merge_pcaps[0]} {target_pcap_path}')
+
+    if os.path.exists(target_pcap_path):
+        fabricate_metadata.status = "Finished"
+        fabricate_metadata.download_link = f'https://{fabricate_metadata.sensor}:8000/pcaps/{fabricate_metadata.pcaps_dir}/{fabricate_metadata.file_name}'
+        write_metadata(fabricate_metadata, 'pfab')
+
+
+def get_time_ranges(after, before):
+
+    buckets = []
+
     try:
-        print(f'Navigating to path: {path}. Mode: {"OFFLINE" if offline_mode else "ONLINE"}. page load: {page_load_time}')
-        driver.set_page_load_timeout(page_load_time)
-        driver.get(path)
-        driver.implicitly_wait(5)
-        if wait_time > 0 or DEFAULT_WAIT_TIME > 0:
-            time.sleep(wait_time or DEFAULT_WAIT_TIME)
-        check_response(driver)
-        print('Navigating to path - COMPLETED')
+        after = parse(after)
+        before = parse(before)
 
-        url = codecs.encode(path, 'rot13')
-        html = codecs.encode(driver.page_source, 'rot13')
-        image_b64 = base64.b64encode(get_image(driver, width, height)).decode('utf8')
-        file_name = codecs.encode(f'{urlparse(path).netloc}_{datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")}', 'rot13')
+        if before < after:
+            raise HTTPException(
+                status_code=HTTP_403_FORBIDDEN, detail='Before time must be prior to After time'
+            )
+    except:
+        raise HTTPException(
+                status_code=HTTP_403_FORBIDDEN, detail='Before and After time window parsing error'
+            )
 
-        output = Rasterized_Url(image_b64=image_b64, file_name=file_name, html=html, url=url)
+    day_increment = after + timedelta(days=1)
 
-        return output
+    while(before > day_increment):
+        after_str = after.strftime('%Y-%m-%dT%H:%M:%SZ')
+        day_increment_str = day_increment.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    except (InvalidArgumentException, NoSuchElementException) as ex:
-        if 'invalid argument' in str(ex):
-            err_msg = URL_ERROR_MSG + str(ex)
-            return_err_or_warn(err_msg)
+        buckets.append(f'after {after_str} and before {day_increment_str}')
+
+        after = day_increment
+        day_increment = after + timedelta(days=1)
+
+    after_str = after.strftime('%Y-%m-%dT%H:%M:%SZ')
+    before_str = before.strftime('%Y-%m-%dT%H:%M:%SZ')
+    buckets.append(f'after {after_str} and before {before_str}')
+
+    return buckets
+
+
+def stenoread(pcap_metadata: PCAPFab_PCAP_Metadata, pcap_request: PCAPFab_PCAP_Request):
+
+    bashChildren = []
+
+    time_ranges = get_time_ranges(pcap_request.after, pcap_request.before)
+
+    pcap_paths = []
+
+    dir_base = '/nsm/pcapfab/pcaps'
+
+    for count, time_range in enumerate(time_ranges):
+
+        pcap_path = f'{dir_base}/{pcap_request.pcap_dir}/{pcap_metadata.file_name}.{count}'
+
+        pcap_paths.append(pcap_path)
+        
+        if pcap_request.tcpdump_args:
+            tcpdump_args = f'-w {pcap_path} {pcap_request.tcpdump_args}'
         else:
-            return_err_or_warn(f'Invalid exception: {ex}\nTrace:{traceback.format_exc()}')
-    except TimeoutException as ex:
-        return_err_or_warn(f'Timeout exception with max load time of: {page_load_time} seconds. {ex}')
-    except Exception as ex:
-        err_str = f'General error: {ex}\nTrace:{traceback.format_exc()}'
-        print(err_str)
-        return_err_or_warn(err_str)
-    finally:
-        quit_driver_and_reap_children(driver)
+            tcpdump_args = f'-w {pcap_path}'
+
+        runBashParallel(bashChildren, f"stenoread '{pcap_request.query} and {time_range}' {tcpdump_args}")
+
+        pcap_metadata.status = "Reading"
+        write_metadata(pcap_metadata, 'p')
 
 
+    while bashChildren:
+        pollChildren(bashChildren)
+        sleep(1)
+
+    pcaps = []
+    for path in pcap_paths:
+        if os.path.exists(path):
+            pcaps.append(path)
+    
+    if not pcaps:
+        pcap_metadata.status = "Finished"
+        pcap_metadata.status_msg = "No pcaps found"
+        pcap_metadata.pcap_end = datetime.now().isoformat()
+        pcap_metadata.pcap_duration = (parse(pcap_metadata.pcap_end) - parse(pcap_metadata.pcap_start)).seconds
+        write_metadata(pcap_metadata, 'p')
+        return
+    elif len(pcaps) > 1:
+        pcap_metadata.status = "Merging"
+        write_metadata(pcap_metadata, 'p')
+    
+        runBash(f"mergecap -a -w {dir_base}/{pcap_request.pcap_dir}/{pcap_metadata.file_name} {' '.join(pcaps)} && rm {' '.join(pcaps)}")
+    else:
+        runBash(f"mv {pcaps[0]} {dir_base}/{pcap_request.pcap_dir}/{pcap_metadata.file_name}")
+
+    pcap_metadata.status = "Finished"
+    pcap_metadata.pcap_end = datetime.now().isoformat()
+    pcap_metadata.pcap_duration = (parse(pcap_metadata.pcap_end) - parse(pcap_metadata.pcap_start)).seconds
+    pcap_metadata.download_link = f'https://{pcap_metadata.sensor}:8000/pcaps/{pcap_request.pcap_dir}/{pcap_metadata.file_name}'
+    write_metadata(pcap_metadata, 'p')
 
 
 def main():
     global testout
-    try:
+    # try:
 
-        wait_time = DEFAULT_WAIT_TIME
-        page_load = DEFAULT_PAGE_LOAD_TIME
+        # wait_time = DEFAULT_WAIT_TIME
+        # page_load = DEFAULT_PAGE_LOAD_TIME
 
-        url = Rasterize_Url(url='https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb')
+        # url = Rasterize_Url(url='https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb')
 
-        output = rasterize(path=url.url, width=url.width, height=url.height, wait_time=wait_time, max_page_load_time=page_load)
+        # output = rasterize(path=url.url, width=url.width, height=url.height, wait_time=wait_time, max_page_load_time=page_load)
         # testout = asyncio.run(create_rasterize_url(url))
 
-    except Exception as ex:
-        return_err_or_warn(f'Unexpected exception: {ex}\nTrace:{traceback.format_exc()}')
+    # except Exception as ex:
+    #     return_err_or_warn(f'Unexpected exception: {ex}\nTrace:{traceback.format_exc()}')
 
 
 
